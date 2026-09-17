@@ -1,0 +1,33 @@
+services:
+  # Backend Web Service (Django)
+  - type: web
+    name: eduptm-backend
+    env: python
+    region: ohio
+    plan: free
+    rootDir: backend
+    buildCommand: "./build.sh"
+    startCommand: "gunicorn ptm_core.wsgi:application"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9.18
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DEBUG
+        value: "False"
+
+  # Frontend Static Site (React/Vite)
+  - type: web
+    name: eduptm-frontend
+    env: static
+    rootDir: frontend
+    buildCommand: "yarn install && yarn build"
+    staticPublishPath: "./dist"
+    envVars:
+      - key: NODE_VERSION
+        value: 20.18.0
+      - key: VITE_API_URL
+        fromService:
+          type: web
+          name: eduptm-backend
+          envVarKey: RENDER_EXTERNAL_URL
