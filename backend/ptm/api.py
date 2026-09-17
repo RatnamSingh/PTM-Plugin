@@ -1,9 +1,10 @@
 from typing import List
 from ninja import NinjaAPI, Schema
+from ninja.errors import HttpError
 from ninja.security import HttpBearer
 from django.shortcuts import get_object_or_404
 from django.conf import settings
-from .models import PTMEvent, PTMSlot, PTMBooking
+from .models import PTMEvent, PTMSlot, PTMBooking, Client
 from .tasks import send_booking_confirmation_sms, send_booking_confirmation_email, dispatch_webhook
 import datetime
 import jwt
@@ -39,16 +40,27 @@ def add_dyte_participant(meeting_id, name, preset_name):
         return response.json()['data']['token']
     return None
 
-# --- JWT Authentication Setup ---
+# --- API Key & JWT Authentication Setup ---
+class APIKeyAuth(HttpBearer):
+    def authenticate(self, request, token):
+        try:
+            client = Client.objects.get(api_key=token)
+            return {"tenant_id": client.tenant_id, "role": "ADMIN", "client": client}
+        except Client.DoesNotExist:
+            return None
+
 class JWTAuth(HttpBearer):
     def authenticate(self, request, token):
         try:
-            # We'll use the django SECRET_KEY as our JWT signing key
-            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=['HS256'])
-            return payload # Returns the decoded payload to be used in the endpoint
-        except jwt.ExpiredSignatureError:
-            return None
-        except jwt.InvalidTokenError:
+            unverified_payload = jwt.decode(token, options={"verify_signature": False})
+            tenant_id = unverified_payload.get('tenant_id')
+            if not tenant_id:
+                return None
+            client = Client.objects.get(tenant_id=tenant_id)
+            payload = jwt.decode(token, client.api_key, algorithms=['HS256'])
+            payload['client'] = client
+            return payload
+        except (jwt.ExpiredSignatureError, jwt.InvalidTokenError, Client.DoesNotExist):
             return None
 
 # --- Schemas ---
@@ -124,22 +136,6 @@ class MockLoginSchema(Schema):
     user_id: str # The ERP user ID
     tenant_id: str # The school ID
 
-# --- Auth Endpoints (Mock ERP SSO) ---
-@api.post("/auth/mock-sso")
-def mock_login(request, payload: MockLoginSchema):
-    """
-    MOCK ENDPOINT: Simulates an ERP generating a signed JWT token for a user.
-    In production, this would be handled by the ERP or a real SSO identity provider.
-    """
-    token_payload = {
-        'user_id': payload.user_id,
-        'role': payload.role,
-        'tenant_id': payload.tenant_id,
-        'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=2) # Expires in 2 hrs
-    }
-    token = jwt.encode(token_payload, settings.SECRET_KEY, algorithm='HS256')
-    return {"access_token": token}
-
 # --- Protected API Endpoints ---
 @api.get("/events", response=List[EventSchema], auth=JWTAuth())
 def list_events(request):
@@ -155,11 +151,11 @@ def list_events(request):
     cache.set(cache_key, events, 60) # Cache for 60 seconds
     return events
 
-@api.post("/events", response=EventSchema, auth=JWTAuth())
+@api.post("/events", response=EventSchema, auth=APIKeyAuth())
 def create_event(request, payload: EventCreateSchema):
     auth_payload = request.auth
     if auth_payload['role'] != 'ADMIN':
-        return 403, {"message": "Only admins can create events"}
+        raise HttpError(403, "Only admins can create events")
         
     tenant_id = auth_payload['tenant_id']
     
@@ -219,12 +215,12 @@ def create_booking(request, payload: BookingInSchema):
     auth_payload = request.auth
     
     if auth_payload['role'] != 'PARENT':
-        return 403, {"message": "Only parents can book slots"}
+        raise HttpError(403, "Only parents can book slots")
         
     slot = get_object_or_404(PTMSlot, id=payload.slot_id, tenant_id=auth_payload['tenant_id'])
     
     if slot.is_booked:
-        return 400, {"message": "Slot is already booked"}
+        raise HttpError(400, "Slot is already booked")
         
     booking = PTMBooking.objects.create(
         slot=slot,
@@ -273,7 +269,7 @@ def get_parent_bookings(request):
     auth_payload = request.auth
     
     if auth_payload['role'] != 'PARENT':
-        return 403, {"message": "Only parents can view their bookings"}
+        raise HttpError(403, "Only parents can view their bookings")
         
     bookings = PTMBooking.objects.filter(
         tenant_id=auth_payload['tenant_id'],
@@ -304,13 +300,13 @@ def update_booking(request, booking_id: UUID, payload: BookingUpdateSchema):
     auth_payload = request.auth
     
     if auth_payload['role'] != 'TEACHER':
-        return 403, {"message": "Only teachers can update bookings"}
+        raise HttpError(403, "Only teachers can update bookings")
         
     booking = get_object_or_404(PTMBooking, id=booking_id, tenant_id=auth_payload['tenant_id'])
     
     # Ensure this teacher owns the slot
     if booking.slot.teacher_id != auth_payload['user_id']:
-        return 403, {"message": "Not authorized to update this booking"}
+        raise HttpError(403, "Not authorized to update this booking")
         
     if payload.status is not None:
         booking.status = payload.status
@@ -339,7 +335,7 @@ def get_dyte_token(request, booking_id: UUID):
     booking = get_object_or_404(PTMBooking, id=booking_id, tenant_id=auth_payload['tenant_id'])
     
     if not booking.slot.dyte_meeting_id:
-        return 400, {"message": "No Dyte meeting associated with this booking."}
+        raise HttpError(400, "No Dyte meeting associated with this booking.")
         
     participant_name = f"{auth_payload['role']} - {auth_payload['user_id']}"
     preset = "group_call_host" if auth_payload['role'] == "TEACHER" else "group_call_participant"
@@ -348,7 +344,19 @@ def get_dyte_token(request, booking_id: UUID):
     if token:
         return {"token": token}
         
-    return 500, {"message": "Failed to generate Dyte token"}
+    raise HttpError(500, "Failed to generate Dyte token")
+
+
+class WebhookUpdateSchema(Schema):
+    webhook_url: str
+
+@api.patch("/webhooks", auth=APIKeyAuth())
+def update_webhook(request, payload: WebhookUpdateSchema):
+    client = request.auth['client']
+    client.webhook_url = payload.webhook_url
+    client.save()
+    return {"message": "Webhook URL updated successfully", "webhook_url": client.webhook_url}
+
 
 # --- Analytics Endpoints ---
 class AnalyticsSchema(Schema):
@@ -382,7 +390,7 @@ def get_teacher_schedule(request):
     auth_payload = request.auth
     
     if auth_payload['role'] != 'TEACHER':
-        return 403, {"message": "Only teachers can view their schedule"}
+        raise HttpError(403, "Only teachers can view their schedule")
         
     tenant_id = auth_payload['tenant_id']
     teacher_id = auth_payload['user_id']
