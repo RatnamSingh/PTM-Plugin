@@ -47,12 +47,6 @@ services:
       - redis
       - backend
 
-  frontend:
-    build: ./frontend
-    ports:
-      - "80:80"
-    depends_on:
-      - backend
 
 volumes:
   postgres_data:
